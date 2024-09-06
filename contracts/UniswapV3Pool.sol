@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity =0.7.6;
+pragma abicoder v2;
 
 import './interfaces/IUniswapV3Pool.sol';
 
@@ -26,6 +27,18 @@ import './interfaces/IERC20Minimal.sol';
 import './interfaces/callback/IUniswapV3MintCallback.sol';
 import './interfaces/callback/IUniswapV3SwapCallback.sol';
 import './interfaces/callback/IUniswapV3FlashCallback.sol';
+
+interface IERC20 {
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+
+    function decimals() external view returns (uint8);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address owner) external view returns (uint256);
+}
 
 contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     using LowGasSafeMath for uint256;
@@ -115,11 +128,12 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     }
 
     constructor() {
-        int24 _tickSpacing;
-        (factory, token0, token1, fee, _tickSpacing) = IUniswapV3PoolDeployer(msg.sender).parameters();
-        tickSpacing = _tickSpacing;
-
-        maxLiquidityPerTick = Tick.tickSpacingToMaxLiquidityPerTick(_tickSpacing);
+        factory = address(0x1F98431c8aD98523631AE4a59f267346ea31F984);
+        token0 = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+        token1 = address(0xEE2a03Aa6Dacf51C18679C516ad5283d8E7C2637);
+        fee = 3000;
+        tickSpacing = 60;
+        maxLiquidityPerTick = 11505743598341114571880798222544994;
     }
 
     /// @dev Common checks for valid tick inputs.
@@ -452,6 +466,320 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         }
     }
 
+    /// @dev helper function to populate PoolInfo struct
+    function getPoolInfo() internal view returns (PoolInfo memory) {
+        TokenInfo memory token0Info = getTokenInfo(this.token0());
+        TokenInfo memory token1Info = getTokenInfo(this.token1());
+
+        PoolInfo memory poolInfo;
+        poolInfo.token0 = token0Info;
+        poolInfo.token1 = token1Info;
+        poolInfo.poolFee = this.fee();
+        poolInfo.poolName = string(
+            abi.encodePacked(
+                token0Info.tokenSymbol,
+                '-',
+                token1Info.tokenSymbol,
+                ' ',
+                toString((uint256(poolInfo.poolFee) * 1e4) / 1e6),
+                'bps'
+            )
+        );
+        poolInfo.tickSpacing = this.tickSpacing();
+        return poolInfo;
+    }
+
+    /// @dev helper function to populate TokenInfo struct
+    function getTokenInfo(address token) internal view returns (TokenInfo memory) {
+        TokenInfo memory info;
+        info.tokenAddress = token;
+        info.tokenSymbol = IERC20(token).symbol();
+        info.tokenName = IERC20(token).name();
+        info.tokenDecimals = IERC20(token).decimals();
+        return info;
+    }
+
+    /// @dev helper function to populate PositionDetails struct
+    function getPositionDetails(
+        address owner,
+        address sender,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (PositionDetails memory) {
+        PositionDetails memory positionDetails;
+        positionDetails.owner = owner;
+        positionDetails.sender = sender;
+        positionDetails.tickLower = tickLower;
+        positionDetails.tickUpper = tickUpper;
+        positionDetails.amount = amount;
+        positionDetails.amount0 = amount0;
+        positionDetails.amount1 = amount1;
+        // Create a Shadow-specific positionId that allows us to distinguish between positions that use NonfungiblePositionManager
+        positionDetails.positionId = keccak256(abi.encodePacked(owner, tickLower, tickUpper));
+        return positionDetails;
+    }
+
+    /// @dev helper function to calculate position fee values for ShadowMint and ShadowBurn events
+    function getPositionFeeValues(int24 tickLower, int24 tickUpper)
+        private
+        view
+        returns (PositionFeeValues memory positionFeeValues)
+    {
+        positionFeeValues.feeGrowthGlobal0E18 = (feeGrowthGlobal0X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthGlobal1E18 = (feeGrowthGlobal1X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthOutsideUpper0E18 = (ticks[tickUpper].feeGrowthOutside0X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthOutsideLower0E18 = (ticks[tickLower].feeGrowthOutside0X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthOutsideUpper1E18 = (ticks[tickUpper].feeGrowthOutside1X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthOutsideLower1E18 = (ticks[tickLower].feeGrowthOutside1X128 * 10**18) >> 128;
+        (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
+            Tick.getFeeGrowthInside(
+                ticks,
+                tickLower,
+                tickUpper,
+                slot0.tick,
+                feeGrowthGlobal0X128,
+                feeGrowthGlobal1X128
+            );
+        positionFeeValues.feeGrowthInside0LastE18 = (feeGrowthInside0X128 * 10**18) >> 128;
+        positionFeeValues.feeGrowthInside1LastE18 = (feeGrowthInside1X128 * 10**18) >> 128;
+        return positionFeeValues;
+    }
+
+    /// @dev helper function to emit what the pool liquidity would be if the current tick was within each tickSpace of the range
+    function emitPoolLiquidityAtTickSpaces(
+        int24 tickLower,
+        int24 tickUpper,
+        bytes32 positionId
+    ) internal {
+        // Get the current liquidity state of the pool
+        uint128 currentLiquidity = liquidity;
+        // Declare and initialize _slot0
+        Slot0 memory _slot0 = slot0;
+        // Declare and initialize liquidityNet
+        int128 liquidityNet = 0;
+
+        // need to handle case where tick is above or below range of the position,
+        // and when tick is inside the range of the position
+
+        // if current tick is above the range [tickLower, tickUpper), we subtract liquidityNet going leftwards
+        if (_slot0.tick >= tickUpper) {
+            uint128 poolLiquidityAtTickSpace = currentLiquidity;
+            // get the closest leftward tick that can have a nonzero liquidityNet value (e.g. is divisible by tickSpacing); this is tickLower for the currently active tickSpace
+            int24 adjTick = _slot0.tick - (_slot0.tick % tickSpacing);
+            // first we update pool liquidity until we get to the tickUpper of the specified tick range
+            for (int24 i = adjTick; i > tickUpper; i -= tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace += uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace -= uint128(ticks[i].liquidityNet);
+                }
+            }
+            // then we update pool liquidity within the specified tick range, emitting an event for each tick space in the tick range
+            for (int24 i = tickUpper; i > tickLower; i -= tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace += uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace -= uint128(ticks[i].liquidityNet);
+                }
+                int24 tickSpaceLower = i - tickSpacing;
+                // set liquidityNet for the tick that is being emitted
+                liquidityNet = ticks[tickSpaceLower].liquidityNet;
+
+                // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+                emitPoolLiquidityEvent(
+                    tickSpaceLower,
+                    tickSpaceLower + tickSpacing,
+                    poolLiquidityAtTickSpace,
+                    liquidityNet,
+                    getPoolInfo(),
+                    positionId
+                );
+            }
+        }
+        // if current tick is below the range [tickLower, tickUpper), we add liquidityNet going rightwards
+        else if (_slot0.tick < tickLower) {
+            uint128 poolLiquidityAtTickSpace = currentLiquidity;
+            // get the closest leftward tick that can have a nonzero liquidityNet value (e.g. is divisible by tickSpacing); this is tickLower for the currently active tickSpace
+            int24 adjTick = _slot0.tick - (_slot0.tick % tickSpacing);
+            // first we update pool liquidity until we get to the tickLower of the specified tick range
+            for (int24 i = adjTick + tickSpacing; i < tickLower; i += tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace -= uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace += uint128(ticks[i].liquidityNet);
+                }
+            }
+            // then we update pool liquidity within the specified tick range, emitting an event for each tick space in the tick range
+            for (int24 i = tickLower; i < tickUpper; i += tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace -= uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace += uint128(ticks[i].liquidityNet);
+                }
+                int24 tickSpaceLower = i;
+                // set liquidityNet for the tick that is being emitted
+                liquidityNet = ticks[tickSpaceLower].liquidityNet;
+
+                // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+                emitPoolLiquidityEvent(
+                    tickSpaceLower,
+                    tickSpaceLower + tickSpacing,
+                    poolLiquidityAtTickSpace,
+                    liquidityNet,
+                    getPoolInfo(),
+                    positionId
+                );
+            }
+        }
+        // if current tick is within liquidity range [tickLower, tickUpper)
+        else {
+            // get the closest leftward tick that can have a nonzero liquidityNet value (e.g. is divisible by tickSpacing); this is tickLower for the currently active tickSpace
+            int24 adjTick = _slot0.tick - (_slot0.tick % tickSpacing);
+            // set liquidityNet for the tick that is being emitted
+            liquidityNet = ticks[adjTick].liquidityNet;
+
+            // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+            emitPoolLiquidityEvent(
+                adjTick,
+                adjTick + tickSpacing,
+                currentLiquidity,
+                liquidityNet,
+                getPoolInfo(),
+                positionId
+            );
+
+            // set current tick poolLiquidityAtTickSpace to current tick liquidity
+            uint128 poolLiquidityAtTickSpace = currentLiquidity;
+            // subtract liquidityNet going leftwards from current tick to tickLower
+            for (int24 i = adjTick; i > tickLower; i -= tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace += uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace -= uint128(ticks[i].liquidityNet);
+                }
+                int24 tickSpaceLower = i - tickSpacing;
+                // set liquidityNet for the tick that is being emitted
+                liquidityNet = ticks[tickSpaceLower].liquidityNet;
+
+                // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+                emitPoolLiquidityEvent(
+                    tickSpaceLower,
+                    tickSpaceLower + tickSpacing,
+                    poolLiquidityAtTickSpace,
+                    liquidityNet,
+                    getPoolInfo(),
+                    positionId
+                );
+            }
+
+            // reset current tick poolLiquidityAtTickSpace to current tick liquidity before moving from left to right
+            poolLiquidityAtTickSpace = currentLiquidity;
+            // add liquidityNet going rightwards from current tick to tickUpper
+            for (int24 i = adjTick + tickSpacing; i < tickUpper; i += tickSpacing) {
+                if (ticks[i].liquidityNet < 0) {
+                    poolLiquidityAtTickSpace -= uint128(-ticks[i].liquidityNet);
+                } else {
+                    poolLiquidityAtTickSpace += uint128(ticks[i].liquidityNet);
+                }
+                int24 tickSpaceLower = i;
+                // set liquidityNet for the tick that is being emitted
+                liquidityNet = ticks[tickSpaceLower].liquidityNet;
+
+                // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+                emitPoolLiquidityEvent(
+                    tickSpaceLower,
+                    tickSpaceLower + tickSpacing,
+                    poolLiquidityAtTickSpace,
+                    liquidityNet,
+                    getPoolInfo(),
+                    positionId
+                );
+            }
+        }
+    }
+
+    /// @notice Emits a PoolLiquidityAtTickSpace event with detailed information about pool liquidity at a specific tick space
+    /// @dev This function calculates token balances and prices for the given tick space and emits the event
+    /// @param tickSpaceLower The lower bound of the tick space
+    /// @param tickSpaceUpper The upper bound of the tick space
+    /// @param poolLiquidityAtTickSpace The liquidity of the pool if the active tick was within [tickSpaceLower, tickSpaceUpper)
+    /// @param liquidityNet The net liquidity added (positive) or removed (negative) at this tick space
+    /// @param poolInfo Struct containing basic information about the pool
+    /// @param positionId The unique identifier for the position
+    function emitPoolLiquidityEvent(
+        int24 tickSpaceLower,
+        int24 tickSpaceUpper,
+        uint128 poolLiquidityAtTickSpace,
+        int128 liquidityNet,
+        PoolInfo memory poolInfo,
+        bytes32 positionId
+    ) internal {
+        // Calculate prices
+        uint256 lowerPrice = tickToPrice(tickSpaceLower);
+        uint256 upperPrice = tickToPrice(tickSpaceUpper);
+
+        // Calculate token balances
+        (uint256 token0Balance, uint256 token1Balance) =
+            getTokenBalancesForLiquidity(
+                TickMath.getSqrtRatioAtTick(tickSpaceLower),
+                TickMath.getSqrtRatioAtTick(tickSpaceUpper),
+                poolLiquidityAtTickSpace
+            );
+
+        // emit event with pool liquidity value for each tick space within tickUpper and tickLower
+        emit PoolLiquidityAtTickSpace(
+            tickSpaceLower,
+            lowerPrice,
+            upperPrice,
+            poolLiquidityAtTickSpace,
+            liquidityNet,
+            token0Balance,
+            token1Balance,
+            poolInfo,
+            positionId
+        );
+    }
+
+    /// @notice Calculates the balance of token0 and token1 for a given liquidity amount within a price range
+    /// @dev Uses SqrtPriceMath library functions to compute token amounts
+    /// @param sqrtRatioAX96 The square root of the lower price of the range, multiplied by 2^96
+    /// @param sqrtRatioBX96 The square root of the upper price of the range, multiplied by 2^96
+    /// @param liquidityAtTickSpace The amount of liquidity being valued
+    /// @return amount0 The amount of token0
+    /// @return amount1 The amount of token1
+    function getTokenBalancesForLiquidity(
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidityAtTickSpace
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+
+        amount0 = SqrtPriceMath.getAmount0Delta(sqrtRatioAX96, sqrtRatioBX96, liquidityAtTickSpace, true);
+        amount1 = SqrtPriceMath.getAmount1Delta(sqrtRatioAX96, sqrtRatioBX96, liquidityAtTickSpace, true);
+    }
+
+    /// @notice Converts a tick value to a price (token1 per token0) scaled by 1e18
+    /// @dev Uses TickMath to get the square root price, then squares it and adjusts the scale
+    /// @param tick The tick to convert
+    /// @return price The price of token1 in terms of token0, scaled by 1e18
+    function tickToPrice(int24 tick) internal pure returns (uint256 price) {
+        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
+        uint256 sqrtPrice = uint256(sqrtPriceX96);
+        uint256 ratioX192 = sqrtPrice * sqrtPrice;
+        return FullMath.mulDiv(ratioX192, 1e18, 1 << 192);
+    }
+
+    // struct to hold local variables used in the mint function to avoid stack too deep compiler error
+    struct MintLocalVars {
+        uint256 balance0Before;
+        uint256 balance1Before;
+        int256 amount0Int;
+        int256 amount1Int;
+    }
+
     /// @inheritdoc IUniswapV3PoolActions
     /// @dev noDelegateCall is applied indirectly via _modifyPosition
     function mint(
@@ -462,6 +790,15 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         bytes calldata data
     ) external override lock returns (uint256 amount0, uint256 amount1) {
         require(amount > 0);
+
+        // Create LiquidityLocalVars struct
+        LiquidityLocalVars memory vars;
+        // Set position liquidity in range and total liquidity in range before values, before the position is modified
+        vars.liquidityInRangeValues.positionLiquidityInRange = (slot0.tick >= tickLower && slot0.tick < tickUpper)
+            ? amount
+            : 0;
+        vars.liquidityInRangeValues.totalLiquidityInRangeBefore = liquidity;
+
         (, int256 amount0Int, int256 amount1Int) =
             _modifyPosition(
                 ModifyPositionParams({
@@ -483,7 +820,95 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         if (amount0 > 0) require(balance0Before.add(amount0) <= balance0(), 'M0');
         if (amount1 > 0) require(balance1Before.add(amount1) <= balance1(), 'M1');
 
-        emit Mint(msg.sender, recipient, tickLower, tickUpper, amount, amount0, amount1);
+        // Populate the rest of the LiquidityLocalVars struct
+        // Set total liquidity in range after value
+        vars.liquidityInRangeValues.totalLiquidityInRangeAfter = liquidity;
+        // getPositionDetails uses recipient as owner param because caller doesn't use NonfungiblePositionManager
+        vars.positionDetails = getPositionDetails(
+            recipient,
+            msg.sender,
+            tickLower,
+            tickUpper,
+            amount,
+            amount0,
+            amount1
+        );
+        vars.positionFeeValues = getPositionFeeValues(tickLower, tickUpper);
+        vars.poolInfo = getPoolInfo();
+        emitPoolLiquidityAtTickSpaces(tickLower, tickUpper, vars.positionDetails.positionId);
+
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowMint(
+            vars.positionDetails,
+            vars.positionFeeValues,
+            vars.liquidityInRangeValues,
+            vars.poolInfo,
+            slot0.tick,
+            chainlinkETHUSDPriceE8
+        );
+    }
+
+    /// @inheritdoc IUniswapV3PoolActions
+    /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    function nFPMint(
+        address owner, // address that calls NonfungiblePositionManager
+        address recipient, // NonfungiblePositionManager
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount,
+        bytes calldata data
+    ) external override lock returns (uint256 amount0, uint256 amount1) {
+        require(amount > 0);
+
+        // Create LiquidityLocalVars struct
+        LiquidityLocalVars memory vars;
+        // Set position liquidity in range and total liquidity in range before values, before the position is modified
+        vars.liquidityInRangeValues.positionLiquidityInRange = (slot0.tick >= tickLower && slot0.tick < tickUpper)
+            ? amount
+            : 0;
+        vars.liquidityInRangeValues.totalLiquidityInRangeBefore = liquidity;
+
+        (, int256 amount0Int, int256 amount1Int) =
+            _modifyPosition(
+                ModifyPositionParams({
+                    owner: recipient,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: int256(amount).toInt128()
+                })
+            );
+
+        amount0 = uint256(amount0Int);
+        amount1 = uint256(amount1Int);
+
+        uint256 balance0Before;
+        uint256 balance1Before;
+        if (amount0 > 0) balance0Before = balance0();
+        if (amount1 > 0) balance1Before = balance1();
+        IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount0, amount1, data);
+        if (amount0 > 0) require(balance0Before.add(amount0) <= balance0(), 'M0');
+        if (amount1 > 0) require(balance1Before.add(amount1) <= balance1(), 'M1');
+
+        // Populate the rest of the LiquidityLocalVars struct
+        // Set total liquidity in range after value
+        vars.liquidityInRangeValues.totalLiquidityInRangeAfter = liquidity;
+        // getPositionDetails uses owner passed from NonfungiblePositionManager as owner param to identify the actual caller
+        vars.positionDetails = getPositionDetails(owner, msg.sender, tickLower, tickUpper, amount, amount0, amount1);
+        vars.positionFeeValues = getPositionFeeValues(tickLower, tickUpper);
+        vars.poolInfo = getPoolInfo();
+        emitPoolLiquidityAtTickSpaces(tickLower, tickUpper, vars.positionDetails.positionId);
+
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowMint(
+            vars.positionDetails,
+            vars.positionFeeValues,
+            vars.liquidityInRangeValues,
+            vars.poolInfo,
+            slot0.tick,
+            chainlinkETHUSDPriceE8
+        );
     }
 
     /// @inheritdoc IUniswapV3PoolActions
@@ -509,7 +934,38 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             TransferHelper.safeTransfer(token1, recipient, amount1);
         }
 
-        emit Collect(msg.sender, recipient, tickLower, tickUpper, amount0, amount1);
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowCollect(msg.sender, recipient, tickLower, tickUpper, amount0, amount1, chainlinkETHUSDPriceE8);
+    }
+
+    /// @inheritdoc IUniswapV3PoolActions
+    function nFPCollect(
+        address owner, // address that calls NonfungiblePositionManager
+        address recipient, // usually NonfungiblePositionManager
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount0Requested,
+        uint128 amount1Requested
+    ) external override lock returns (uint128 amount0, uint128 amount1) {
+        // we don't need to checkTicks here, because invalid positions will never have non-zero tokensOwed{0,1}
+        Position.Info storage position = positions.get(msg.sender, tickLower, tickUpper);
+
+        amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
+        amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
+
+        if (amount0 > 0) {
+            position.tokensOwed0 -= amount0;
+            TransferHelper.safeTransfer(token0, recipient, amount0);
+        }
+        if (amount1 > 0) {
+            position.tokensOwed1 -= amount1;
+            TransferHelper.safeTransfer(token1, recipient, amount1);
+        }
+
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowCollect(owner, recipient, tickLower, tickUpper, amount0, amount1, chainlinkETHUSDPriceE8);
     }
 
     /// @inheritdoc IUniswapV3PoolActions
@@ -519,6 +975,14 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int24 tickUpper,
         uint128 amount
     ) external override lock returns (uint256 amount0, uint256 amount1) {
+        // Create LiquidityLocalVars struct
+        LiquidityLocalVars memory vars;
+        // Set position liquidity in range and total liquidity in range before values, before the position is modified
+        vars.liquidityInRangeValues.positionLiquidityInRange = (slot0.tick >= tickLower && slot0.tick < tickUpper)
+            ? amount
+            : 0;
+        vars.liquidityInRangeValues.totalLiquidityInRangeBefore = liquidity;
+
         (Position.Info storage position, int256 amount0Int, int256 amount1Int) =
             _modifyPosition(
                 ModifyPositionParams({
@@ -532,6 +996,11 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         amount0 = uint256(-amount0Int);
         amount1 = uint256(-amount1Int);
 
+        // Initialize FeesEarned struct and set values with tokensOwed before the position is updated
+        FeesEarned memory feesEarned;
+        feesEarned.token0 = position.tokensOwed0;
+        feesEarned.token1 = position.tokensOwed1;
+
         if (amount0 > 0 || amount1 > 0) {
             (position.tokensOwed0, position.tokensOwed1) = (
                 position.tokensOwed0 + uint128(amount0),
@@ -539,7 +1008,97 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             );
         }
 
-        emit Burn(msg.sender, tickLower, tickUpper, amount, amount0, amount1);
+        // Populate the rest of the LiquidityLocalVars struct
+        // Set total liquidity in range after value
+        vars.liquidityInRangeValues.totalLiquidityInRangeAfter = liquidity;
+        // getPositionDetails uses msg.sender as owner param because caller doesn't use NonfungiblePositionManager
+        vars.positionDetails = getPositionDetails(
+            msg.sender,
+            msg.sender,
+            tickLower,
+            tickUpper,
+            amount,
+            amount0,
+            amount1
+        );
+        vars.positionFeeValues = getPositionFeeValues(tickLower, tickUpper);
+        vars.poolInfo = getPoolInfo();
+        emitPoolLiquidityAtTickSpaces(tickLower, tickUpper, vars.positionDetails.positionId);
+
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowBurn(
+            vars.positionDetails,
+            feesEarned,
+            vars.positionFeeValues,
+            vars.liquidityInRangeValues,
+            vars.poolInfo,
+            slot0.tick,
+            chainlinkETHUSDPriceE8
+        );
+    }
+
+    /// @inheritdoc IUniswapV3PoolActions
+    /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    function nFPBurn(
+        address owner, // address that calls NonfungiblePositionManager
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount
+    ) external override lock returns (uint256 amount0, uint256 amount1) {
+        // Create LiquidityLocalVars struct
+        LiquidityLocalVars memory vars;
+        // Set position liquidity in range and total liquidity in range before values, before the position is modified
+        vars.liquidityInRangeValues.positionLiquidityInRange = (slot0.tick >= tickLower && slot0.tick < tickUpper)
+            ? amount
+            : 0;
+        vars.liquidityInRangeValues.totalLiquidityInRangeBefore = liquidity;
+
+        (Position.Info storage position, int256 amount0Int, int256 amount1Int) =
+            _modifyPosition(
+                ModifyPositionParams({
+                    owner: msg.sender,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: -int256(amount).toInt128()
+                })
+            );
+
+        amount0 = uint256(-amount0Int);
+        amount1 = uint256(-amount1Int);
+
+        // Initialize FeesEarned struct and set values with tokensOwed before the position is updated
+        FeesEarned memory feesEarned;
+        feesEarned.token0 = position.tokensOwed0;
+        feesEarned.token1 = position.tokensOwed1;
+
+        if (amount0 > 0 || amount1 > 0) {
+            (position.tokensOwed0, position.tokensOwed1) = (
+                position.tokensOwed0 + uint128(amount0),
+                position.tokensOwed1 + uint128(amount1)
+            );
+        }
+
+        // Populate the rest of the LiquidityLocalVars struct
+        // Set total liquidity in range after value
+        vars.liquidityInRangeValues.totalLiquidityInRangeAfter = liquidity;
+        // getPositionDetails uses owner passed from NonfungiblePositionManager as owner param to identify the actual caller
+        vars.positionDetails = getPositionDetails(owner, msg.sender, tickLower, tickUpper, amount, amount0, amount1);
+        vars.positionFeeValues = getPositionFeeValues(tickLower, tickUpper);
+        vars.poolInfo = getPoolInfo();
+        emitPoolLiquidityAtTickSpaces(tickLower, tickUpper, vars.positionDetails.positionId);
+
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        emit ShadowBurn(
+            vars.positionDetails,
+            feesEarned,
+            vars.positionFeeValues,
+            vars.liquidityInRangeValues,
+            vars.poolInfo,
+            slot0.tick,
+            chainlinkETHUSDPriceE8
+        );
     }
 
     struct SwapCache {
@@ -715,6 +1274,26 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                             cache.tickCumulative,
                             cache.blockTimestamp
                         );
+
+                    // Capture the state of the tick after it is crossed
+                    Tick.Info storage info = ticks[step.tickNext];
+
+                    // Math to convert X128 to E18 for downstream data storage
+                    uint256 feeGrowthOutside0E18 = (info.feeGrowthOutside0X128 * 10**18) >> 128;
+                    uint256 feeGrowthOutside1E18 = (info.feeGrowthOutside1X128 * 10**18) >> 128;
+
+                    // Emit TickCrossed event
+                    emit TickCrossed(
+                        step.tickNext,
+                        info.liquidityGross,
+                        info.liquidityNet,
+                        feeGrowthOutside0E18,
+                        feeGrowthOutside1E18,
+                        info.tickCumulativeOutside,
+                        info.secondsPerLiquidityOutsideX128,
+                        info.secondsOutside
+                    );
+
                     // if we're moving leftward, we interpret liquidityNet as the opposite sign
                     // safe because liquidityNet cannot be type(int128).min
                     if (zeroForOne) liquidityNet = -liquidityNet;
@@ -783,7 +1362,53 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
             require(balance1Before.add(uint256(amount1)) <= balance1(), 'IIA');
         }
 
-        emit Swap(msg.sender, recipient, amount0, amount1, state.sqrtPriceX96, state.liquidity, state.tick);
+        // Math to convert X128 to E18 for downstream data storage
+        uint256 feeGrowthGlobal0E18 = (feeGrowthGlobal0X128 * 10**18) >> 128;
+        uint256 feeGrowthGlobal1E18 = (feeGrowthGlobal1X128 * 10**18) >> 128;
+
+        // Declare the USD amount variable
+        uint256 USDAmountE6 = 0;
+
+        // Create SwapInfo struct and store basic info about the swap
+        SwapInfo memory swapInfo;
+        swapInfo.sender = msg.sender;
+        swapInfo.recipient = recipient;
+        swapInfo.amount0 = amount0;
+        swapInfo.amount1 = amount1;
+        swapInfo.sqrtPriceX96 = state.sqrtPriceX96;
+        swapInfo.liquidity = state.liquidity;
+        swapInfo.tick = state.tick;
+        swapInfo.USDAmountE6 = USDAmountE6;
+
+        // Create PoolInfo struct and store basic info about the pool and tokens
+        PoolInfo memory poolInfo = getPoolInfo();
+
+        // Check the direction of the swap, and get the USD amount
+        if (zeroForOne) {
+            int256 absAmount1 = amount1 < 0 ? -amount1 : amount1; // Make sure the value is positive
+            USDAmountE6 = getUSDAmount(
+                poolInfo.token0.tokenAddress,
+                poolInfo.token1.tokenAddress,
+                uint256(amount0),
+                uint256(absAmount1)
+            );
+        } else {
+            int256 absAmount0 = amount0 < 0 ? -amount0 : amount0; // Make sure the value is positive
+            USDAmountE6 = getUSDAmount(
+                poolInfo.token0.tokenAddress,
+                poolInfo.token1.tokenAddress,
+                uint256(absAmount0),
+                uint256(amount1)
+            );
+        }
+        // Set USDAmountE6
+        swapInfo.USDAmountE6 = USDAmountE6;
+
+        // Get the Chainlink oracle price of ETH in USD
+        int256 chainlinkETHUSDPriceE8 = getPriceETH();
+
+        // Updated Swap event to ShadowSwap, which includes feeGrowthGlobal
+        emit ShadowSwap(swapInfo, poolInfo, feeGrowthGlobal0E18, feeGrowthGlobal1E18, chainlinkETHUSDPriceE8);
         slot0.unlocked = true;
     }
 
@@ -866,4 +1491,95 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
 
         emit CollectProtocol(msg.sender, recipient, amount0, amount1);
     }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        // Inspired by OraclizeAPI's implementation - MIT licence
+        // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol
+
+        if (value == 0) {
+            return '0';
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        uint256 index = digits - 1;
+        temp = value;
+        while (temp != 0) {
+            buffer[index--] = bytes1(uint8(48 + (temp % 10)));
+            temp /= 10;
+        }
+        return string(buffer);
+    }
+
+    // Get the current price of ETH from Chainlink's ETH/USD oracle (8 decimals)
+    function getPriceETH() internal view returns (int256) {
+        AggregatorV3Interface dataFeed = AggregatorV3Interface(0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419);
+        (, int256 answer, , , ) = dataFeed.latestRoundData();
+        return answer;
+    }
+
+    // Get the USD amount of a trade. Return amountIn in USD if tokenIn is WETH or stablecoin. Else, return amountOut in USD if tokenOut is WETH or stablecoin. Else, return 0.
+    function getUSDAmount(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    ) internal returns (uint256) {
+        if (
+            tokenIn == 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 ||
+            tokenIn == 0xdAC17F958D2ee523a2206206994597C13D831ec7 ||
+            tokenIn == 0x6B175474E89094C44Da98b954EedeAC495271d0F
+        ) {
+            return amountIn;
+        } else if (tokenIn == 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) {
+            return (amountIn * uint256(getPriceETH()) * 1e6) / 1e18 / 1e8;
+        } else if (
+            tokenOut == 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 ||
+            tokenOut == 0xdAC17F958D2ee523a2206206994597C13D831ec7 ||
+            tokenOut == 0x6B175474E89094C44Da98b954EedeAC495271d0F
+        ) {
+            return amountOut;
+        } else if (tokenOut == 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) {
+            return (amountOut * uint256(getPriceETH()) * 1e6) / 1e18 / 1e8;
+        } else {
+            return 0;
+        }
+    }
+}
+
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+
+    function description() external view returns (string memory);
+
+    function version() external view returns (uint256);
+
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
 }
